@@ -240,6 +240,16 @@ def procesar_pdf(archivo):
 # ----------------------------------------------------------------------------
 # KPIs (los mismos que la hoja KPIs del Excel, calculados en pandas para la app)
 # ----------------------------------------------------------------------------
+def kilos_por_corte(df, fecha_corte=None, dias_antiguo=90):
+    """Kilos por corte (cm) y, de ellos, cuántos tienen más de N días en stock."""
+    fc = pd.Timestamp(fecha_corte) if fecha_corte else df["Fecha"].max()
+    d = df.assign(_viejo=((fc - df["Fecha"]).dt.days > dias_antiguo) * df["Kilos"])
+    out = d.groupby("Corte", as_index=False).agg(
+        Unidades=("Unidades", "sum"), Kilos=("Kilos", "sum"), Kilos_antiguos=("_viejo", "sum"))
+    out["% antiguo"] = out["Kilos_antiguos"] / out["Kilos"]
+    return out.sort_values("Corte").reset_index(drop=True)
+
+
 def calcular_kpis(df, fecha_corte=None, dias_antiguo=90):
     k, u = df["Kilos"].sum(), df["Unidades"].sum()
     fc = pd.Timestamp(fecha_corte) if fecha_corte else df["Fecha"].max()
@@ -250,7 +260,7 @@ def calcular_kpis(df, fecha_corte=None, dias_antiguo=90):
         "Unidades": int(u),
         "Kilos": int(k),
         "Kilos por unidad": k / u if u else 0,
-        "Gramaje prom. ponderado (g/m²)": (df["Kilos"] * df["Gramaje"]).sum() / k if k else 0,
+        f"Cortes (cm) con stock de más de {dias_antiguo} días": int(df.loc[antig > dias_antiguo, "Corte"].nunique()),
         "Corte prom. ponderado (cm)": (df["Kilos"] * df["Corte"]).sum() / k if k else 0,
         f"Kilos con más de {dias_antiguo} días": int(viejo),
         f"% con más de {dias_antiguo} días": viejo / k if k else 0,
@@ -336,7 +346,7 @@ def _hoja_resumen(w, df_res, nombre, cols_suma):
                 "#,##0.00" if c == "Valorización" else "#,##0")
 
 
-def _hoja_kpis(wb, df, tipo, fecha_corte):
+def _hoja_kpis(wb, df, tipo, fecha_corte, dias_antiguo=90):
     """Hoja KPIs: todo con fórmulas que apuntan a la hoja Detalle."""
     ws = wb.create_sheet("KPIs", 0)
     cols, n = list(df.columns), len(df) + 1
@@ -346,7 +356,7 @@ def _hoja_kpis(wb, df, tipo, fecha_corte):
     ws["A1"] = ("KPIs – Stock Puro" if tipo == "puro" else "KPIs – Stock Destinado a Clientes")
     ws["A1"].font = Font(name=FUENTE, size=14, bold=True)
     ws["A3"], ws["B3"] = "Fecha de corte del reporte", fecha_corte
-    ws["A4"], ws["B4"] = "Días para considerar stock antiguo", 90
+    ws["A4"], ws["B4"] = "Días para considerar stock antiguo", dias_antiguo
     ws["C3"], ws["C4"] = "Dato tomado del PDF (editable)", "Parámetro editable"
     ws["B3"].number_format = "DD/MM/YYYY"
     for a in ("B3", "B4"):
@@ -362,7 +372,7 @@ def _hoja_kpis(wb, df, tipo, fecha_corte):
         ("Unidades totales", f"=SUM({U})", "#,##0", ""),
         ("Kilos totales", f"=SUM({K})", "#,##0", ""),
         ("Kilos por unidad", "=IFERROR(B9/B8,0)", "#,##0.0", "Peso promedio por unidad"),
-        ("Gramaje promedio ponderado", f"=IFERROR(SUMPRODUCT({K},{G})/B9,0)", "#,##0.0", "Ponderado por kilos"),
+        ("Cortes (cm) con kilos antiguos", "=0", "#,##0", "Cantidad de cortes con stock mayor al parámetro (ver tabla Kilos por Corte)"),
         ("Corte promedio ponderado", f"=IFERROR(SUMPRODUCT({K},{C})/B9,0)", "#,##0.0", "Ponderado por kilos (cm)"),
         ("Kilos con antigüedad mayor al parámetro", f'=SUMIF({F},"<"&($B$3-$B$4),{K})', "#,##0", "Según B3 y B4"),
         ("% de kilos antiguos", "=IFERROR(B13/B9,0)", "0.0%", ""),
@@ -386,11 +396,14 @@ def _hoja_kpis(wb, df, tipo, fecha_corte):
         ws.cell(row=r, column=3, value=nota).font = F_NORMAL
 
     # Tablas de desglose (SUMIF contra Detalle). "(sin dato)" = total - resto.
-    def tabla(r, titulo, col, valores, hay_blancos, total_txt="TOTAL"):
+    def tabla(r, titulo, col, valores, hay_blancos, total_txt="TOTAL", antiguo=False):
         ws.cell(row=r, column=1, value=titulo).font = Font(name=FUENTE, size=11, bold=True)
-        for j, h in enumerate([col, "Unidades", "Kilos", "% de kilos"], 1):
+        heads = [col, "Unidades", "Kilos", "% de kilos"]
+        if antiguo:
+            heads += ["Kilos con antigüedad > parámetro", "% de antiguos sobre sus kilos"]
+        for j, h in enumerate(heads, 1):
             ws.cell(row=r + 1, column=j, value=h)
-        _encabezado(ws, r + 1, 4)
+        _encabezado(ws, r + 1, len(heads))
         crit = rng(col)
         r0 = r + 2
         for i, v in enumerate(valores):
@@ -398,6 +411,8 @@ def _hoja_kpis(wb, df, tipo, fecha_corte):
             ws.cell(row=rr, column=1, value=v)
             ws.cell(row=rr, column=2, value=f"=SUMIF({crit},A{rr},{U})")
             ws.cell(row=rr, column=3, value=f"=SUMIF({crit},A{rr},{K})")
+            if antiguo:
+                ws.cell(row=rr, column=5, value=f'=SUMIFS({K},{crit},A{rr},{F},"<"&($B$3-$B$4))')
         rr = r0 + len(valores)
         ult = rr - 1
         if hay_blancos:
@@ -408,20 +423,29 @@ def _hoja_kpis(wb, df, tipo, fecha_corte):
         ws.cell(row=rr, column=1, value=total_txt)
         ws.cell(row=rr, column=2, value=f"=SUM(B{r0}:B{rr - 1})")
         ws.cell(row=rr, column=3, value=f"=SUM(C{r0}:C{rr - 1})")
+        if antiguo:
+            ws.cell(row=rr, column=5, value=f"=SUM(E{r0}:E{rr - 1})")
         for x in range(r0, rr + 1):
             ws.cell(row=x, column=4, value=f"=IFERROR(C{x}/$B$9,0)")
-            for cc, fmt in ((2, "#,##0"), (3, "#,##0"), (4, "0.0%")):
+            formatos = [(2, "#,##0"), (3, "#,##0"), (4, "0.0%")]
+            if antiguo:
+                ws.cell(row=x, column=6, value=f"=IFERROR(E{x}/C{x},0)")
+                formatos += [(5, "#,##0"), (6, "0.0%")]
+            for cc, fmt in formatos:
                 ws.cell(row=x, column=cc).number_format = fmt
-            for cc in range(1, 5):
+            for cc in range(1, len(heads) + 1):
                 ws.cell(row=x, column=cc).font = F_BOLD if x == rr else F_NORMAL
-        return rr + 3
+        return rr + 3, r0, ult
 
     r = 7 + len(k) + 2
-    for titulo, col in (("Kilos por Producto", "Producto"), ("Kilos por Calidad", "Calidad"),
+    for titulo, col in (("Kilos por Producto", "Producto"), ("Kilos por Corte (cm)", "Corte"),
                         ("Kilos por Alistamiento", "Alistamiento"), ("Kilos por Gramaje", "Gramaje")):
         s = df[col]
         vals = sorted(v for v in s.unique() if v != "" and not pd.isna(v))
-        r = tabla(r, titulo, col, vals, bool((s == "").any()))
+        es_corte = col == "Corte"
+        r, r0, ult = tabla(r, titulo, col, vals, bool((s == "").any()), antiguo=es_corte)
+        if es_corte:  # KPI "cortes con kilos antiguos" = cortes con kilos > 0 en la columna E
+            ws["B11"] = f'=COUNTIF(E{r0}:E{ult},">0")'
     if tipo == "destinado":
         top = df.groupby("Cliente")["Kilos"].sum().sort_values(ascending=False).head(10).index.tolist()
         tabla(r, "Top 10 clientes por kilos", "Cliente", top, False, "TOTAL TOP 10")
@@ -430,9 +454,11 @@ def _hoja_kpis(wb, df, tipo, fecha_corte):
     ws.column_dimensions["B"].width = 18
     ws.column_dimensions["C"].width = 38
     ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 20
+    ws.column_dimensions["F"].width = 20
 
 
-def generar_excel(df, tipo, fecha_corte=None):
+def generar_excel(df, tipo, fecha_corte=None, dias_antiguo=90):
     d = df.copy()
     for c in d.select_dtypes(include="object").columns:
         d[c] = d[c].where(d[c].fillna("") != "", None)  # blancos reales en Excel
@@ -470,5 +496,5 @@ def generar_excel(df, tipo, fecha_corte=None):
             _hoja_resumen(w, g.groupby(["Producto", "Calidad", "Gramaje", "Corte"], as_index=False).agg(**ag),
                           "Resumen Gramaje y Corte", ["Unidades", "Kilos"])
         fc = pd.Timestamp(fecha_corte) if fecha_corte else df["Fecha"].max()
-        _hoja_kpis(w.book, df, tipo, fc.to_pydatetime())
+        _hoja_kpis(w.book, df, tipo, fc.to_pydatetime(), dias_antiguo)
     return buf.getvalue()
